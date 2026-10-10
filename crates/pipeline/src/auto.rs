@@ -1,9 +1,10 @@
 //! Auto tone and auto white balance (histogram / grey-world statistics on a proxy).
 
 use lightcraft_color::cct::xy_to_temp_tint;
+use lightcraft_color::transfer::decode_srgb8;
 use lightcraft_color::{REC2020, Xy, bradford, luminance_2020};
 use lightcraft_develop::DevelopSettings;
-use lightcraft_raster::Rgb32f;
+use lightcraft_raster::{Rgb32f, Rgba8};
 use serde::Serialize;
 
 use crate::SourceInfo;
@@ -132,6 +133,73 @@ pub fn current_wb(info: &SourceInfo, s: &DevelopSettings) -> (f64, f64) {
     effective_wb(info, s)
 }
 
+/// Spread of the centre weighting in [`subject_brightness`], as a fraction of the frame: a subject
+/// filling the central half of the frame carries ~64% of the weight, so it, not the background,
+/// sets the median.
+const SUBJECT_SIGMA: f32 = 0.2;
+
+/// How bright the subject of a *rendered* (display-encoded 8-bit) image looks: the weighted
+/// median of log2 linear luminance, weighted towards the centre of the frame. Event and portrait
+/// photos put people near the centre, so they decide "too dark / too bright" rather than a
+/// window or a dark wall at the edge. `None` for an empty image.
+pub fn subject_brightness(img: &Rgba8) -> Option<f64> {
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut samples: Vec<(f32, f32)> = Vec::with_capacity(img.data.len());
+    for (i, px) in img.data.iter().enumerate() {
+        let dx = ((i % w) as f32 + 0.5) / w as f32 - 0.5;
+        let dy = ((i / w) as f32 + 0.5) / h as f32 - 0.5;
+        let weight = (-(dx * dx + dy * dy) / (2.0 * SUBJECT_SIGMA * SUBJECT_SIGMA)).exp();
+        let y = 0.2126 * decode_srgb8(px[0]) + 0.7152 * decode_srgb8(px[1]) + 0.0722 * decode_srgb8(px[2]);
+        samples.push((y.max(1e-4).log2(), weight));
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: f32 = samples.iter().map(|s| s.1).sum();
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    let mut acc = 0.0f32;
+    for (ev, weight) in &samples {
+        acc += weight;
+        if acc >= total * 0.5 {
+            return Some(*ev as f64);
+        }
+    }
+    samples.last().map(|s| s.0 as f64)
+}
+
+/// Close enough: 0.03 EV is well below what anyone sees between two photos in a set.
+const BALANCE_TOLERANCE: f64 = 0.03;
+
+/// The Exposure slider value at which `measure` (render with that Exposure, then
+/// [`subject_brightness`]) reaches `target`, starting from `start`. Exposure moves log
+/// luminance almost one-for-one before the tone curve, so a few secant steps converge; the
+/// result stays in the slider's −5..5 range. `None` when the image can't be measured.
+pub fn solve_exposure(start: f64, target: f64, mut measure: impl FnMut(f64) -> Option<f64>) -> Option<f64> {
+    let (mut x0, mut y0) = (start, measure(start)? - target);
+    if y0.abs() < BALANCE_TOLERANCE {
+        return Some(x0);
+    }
+    let mut x1 = (x0 - y0).clamp(-5.0, 5.0);
+    for _ in 0..6 {
+        let y1 = measure(x1)? - target;
+        if y1.abs() < BALANCE_TOLERANCE {
+            return Some(x1);
+        }
+        let slope = (y1 - y0) / (x1 - x0);
+        // a flat or broken slope (clipped whites, black frame) falls back to a plain one-to-one step
+        let next = if slope.is_finite() && slope.abs() > 0.05 { x1 - y1 / slope } else { x1 - y1 };
+        (x0, y0) = (x1, y1);
+        x1 = next.clamp(-5.0, 5.0);
+        if (x1 - x0).abs() < 1e-3 {
+            break;
+        }
+    }
+    Some(x1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +240,41 @@ mod tests {
         crate::local::scene_linear_pre(&mut out, &SourceInfo::default(), &s);
         let c = out.get(0, 0);
         assert!((c[0] - c[2]).abs() < 0.02, "{c:?}");
+    }
+
+    #[test]
+    fn subject_brightness_follows_the_centre() {
+        // a subject filling the central half, bright on dark vs. the reverse: the subject decides
+        let frame = |centre: u8, edge: u8| {
+            let mut img = Rgba8::new(64, 64);
+            for (i, px) in img.data.iter_mut().enumerate() {
+                let (x, y) = (i % 64, i / 64);
+                let v = if (16..48).contains(&x) && (16..48).contains(&y) { centre } else { edge };
+                *px = [v, v, v, 255];
+            }
+            img
+        };
+        let lit = subject_brightness(&frame(200, 30)).unwrap();
+        let dark = subject_brightness(&frame(30, 200)).unwrap();
+        assert!(lit > dark + 2.0, "{lit} vs {dark}");
+        assert_eq!(subject_brightness(&Rgba8::new(0, 0)), None);
+    }
+
+    #[test]
+    fn solve_exposure_hits_the_target() {
+        // an idealised pipeline: brightness = exposure − 1.3, but whites clip at +1
+        let measure = |e: f64| Some((e - 1.3).min(1.0));
+        let e = solve_exposure(0.0, -0.4, measure).unwrap();
+        assert!((e - 0.9).abs() < BALANCE_TOLERANCE, "{e}");
+        // a compressive tone curve (half slope) still converges
+        let soft = |e: f64| Some(0.5 * e - 1.0);
+        let e = solve_exposure(0.0, -0.5, soft).unwrap();
+        assert!((e - 1.0).abs() < 0.1, "{e}");
+        // unmeasurable images give up instead of guessing
+        assert_eq!(solve_exposure(0.0, 0.0, |_| None), None);
+        // never leaves the slider range
+        let e = solve_exposure(0.0, 50.0, Some).unwrap();
+        assert!(e <= 5.0, "{e}");
     }
 }
 

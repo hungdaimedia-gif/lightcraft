@@ -634,6 +634,56 @@ fn match_total_exposures() {
 }
 
 #[test]
+fn balance_exposure_matches_the_active_photos_subject() {
+    use lightcraft_catalog::PhotoId;
+    let mut s = demo();
+    let ids: Vec<u64> = s.catalog.photos().take(3).map(|p| p.id.0).collect();
+    s.execute("library.select", &json!({"ids": ids})).unwrap();
+    s.selection.active = Some(PhotoId(ids[0]));
+    // one photo far too dark (and with its own look), one far too bright
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": -1.5, "ids": [ids[1]]})).unwrap();
+    s.execute("develop.set", &json!({"control": "light.contrast", "value": 25.0, "ids": [ids[1]]})).unwrap();
+    s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.2, "ids": [ids[2]]})).unwrap();
+    let undo = s.undo.len();
+    let r = s.execute("develop.balanceExposure", &json!({})).unwrap();
+    assert_eq!(r["changed"].as_u64(), Some(2), "{r}");
+    let mut subject = |id: u64| {
+        let img = s.render_now(PhotoId(id), 256, 256).unwrap().image;
+        lightcraft_pipeline::auto::subject_brightness(&img).unwrap()
+    };
+    let target = subject(ids[0]);
+    for id in &ids[1..] {
+        let b = subject(*id);
+        assert!((b - target).abs() < 0.15, "photo {id}: {b} vs reference {target}");
+    }
+    assert_eq!(s.develop_of(PhotoId(ids[1])).unwrap().light.contrast, 25.0, "the look is kept");
+    assert_eq!(s.undo.len(), undo + 1, "one undo step");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.develop_of(PhotoId(ids[1])).unwrap().light.exposure, -1.5);
+}
+
+#[test]
+fn batch_straighten_decides_every_photo_and_respects_the_limit() {
+    use lightcraft_catalog::PhotoId;
+    let mut s = demo();
+    let ids: Vec<u64> = s.catalog.photos().take(4).map(|p| p.id.0).collect();
+    s.execute("library.select", &json!({"ids": ids})).unwrap();
+    let r = s.execute("crop.autoStraightenSelected", &json!({"maxAngle": 45.0})).unwrap();
+    let angles = r["angles"].as_object().unwrap().clone();
+    assert_eq!(angles.len() + r["skipped"].as_array().unwrap().len(), ids.len(), "{r}");
+    for (id, a) in &angles {
+        let got = s.develop_of(PhotoId(id.parse().unwrap())).unwrap().crop.geometry.angle;
+        assert!((got - a.as_f64().unwrap()).abs() < 0.05, "photo {id}: crop {got} vs reported {a}");
+    }
+    // a tight limit only leaves photos alone, it never straightens more
+    if r["changed"].as_u64() > Some(0) {
+        s.execute("edit.undo", &json!({})).unwrap();
+    }
+    let tight = s.execute("crop.autoStraightenSelected", &json!({"maxAngle": 0.5})).unwrap();
+    assert!(tight["angles"].as_object().unwrap().values().all(|a| a.as_f64().unwrap().abs() <= 0.5), "{tight}");
+}
+
+#[test]
 fn find_similar_filters_to_look_alikes() {
     let mut s = demo();
     let id = s.catalog.photos().next().unwrap().id;
