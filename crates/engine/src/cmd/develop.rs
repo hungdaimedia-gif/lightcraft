@@ -37,6 +37,24 @@ fn crop_dims(s: &Session, id: PhotoId) -> (f64, f64) {
     if o.swaps_axes() { (h, w) } else { (w, h) }
 }
 
+/// Set the crop angle on a `w`×`h` photo: keep the current crop if it still fits inside the
+/// rotated image, else shrink to the largest crop of the same aspect.
+fn straighten_to(d: &mut DevelopSettings, w: f64, h: f64, angle: f64) {
+    let r = d.crop.geometry.rect_px(w, h);
+    let fit = crop_fit_angle(w, h, angle, Some(r.width() / r.height()));
+    let cand = CropGeometry { rect: d.crop.geometry.rect, angle };
+    d.crop.geometry = if cand.is_within_image(w, h) { cand } else { fit };
+}
+
+/// Tilts above this are left alone by the batch straighten unless the caller asks otherwise:
+/// on event and portrait sets a bigger tilt is far more often a deliberate "Dutch" angle (or a
+/// misread diagonal) than a crooked horizon.
+const BATCH_STRAIGHTEN_MAX_DEG: f64 = 5.0;
+
+/// The batch exposure balance never moves a photo more than this many stops from where it was,
+/// so a misread (a mostly black frame, a lens cap) can't wreck an edit.
+const BALANCE_MAX_SHIFT_EV: f64 = 3.0;
+
 fn set_aspect(d: &mut DevelopSettings, w: f64, h: f64, aspect: Option<(u32, u32)>) {
     d.crop.aspect = aspect;
     let a = aspect.map(|(aw, ah)| {
@@ -407,11 +425,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let (w, h) = crop_dims(s, id);
                 let angle = f64_req(p, "angle", "crop.straighten")?.clamp(-45.0, 45.0);
                 edit(s, "crop.straighten", "Straighten", |d| {
-                    let r = d.crop.geometry.rect_px(w, h);
-                    let fit = crop_fit_angle(w, h, angle, Some(r.width() / r.height()));
-                    // keep the current crop size if it still fits, else shrink
-                    let cand = CropGeometry { rect: d.crop.geometry.rect, angle };
-                    d.crop.geometry = if cand.is_within_image(w, h) { cand } else { fit };
+                    straighten_to(d, w, h, angle);
                     Ok(())
                 })
             }
@@ -436,6 +450,51 @@ pub fn specs() -> Vec<CommandSpec> {
                 let angle = level.clamp(-45.0, 45.0);
                 s.execute("crop.straighten", &json!({"angle": (angle * 100.0).round() / 100.0}))?;
                 Ok(json!({"changed": true, "angle": angle}))
+            }
+        ),
+        cmd!(
+            "crop.autoStraightenSelected",
+            "Auto Straighten Selected",
+            ["Photo"],
+            None,
+            "{ids?, maxAngle?: degrees (default 5)} — level the horizon of every selected photo in one undo step; photos without clear horizontal/vertical lines (most portraits) or tilted more than maxAngle (likely on purpose) are left alone → {changed, angles: {id: degrees}, skipped: [{id, reason}]}",
+            has_selection,
+            |s, p| {
+                let max = f64_or(p, "maxAngle", BATCH_STRAIGHTEN_MAX_DEG).clamp(0.5, 45.0);
+                let (mut ops, mut angles, mut skipped) = (Vec::new(), serde_json::Map::new(), Vec::new());
+                for id in s.targets(p) {
+                    let src = match s.source_now(id, SourceLevel::Preview) {
+                        Ok(src) => src,
+                        Err(e) => {
+                            skipped.push(json!({"id": id.0, "reason": e}));
+                            continue;
+                        }
+                    };
+                    let info = s.source_info(id);
+                    let d = s.develop_of(id).map(|d| (*d).clone()).unwrap_or_default();
+                    let Some(level) = lightcraft_pipeline::upright::level_degrees(&src, &info, &d) else {
+                        skipped.push(json!({"id": id.0, "reason": "no dominant horizontal or vertical lines"}));
+                        continue;
+                    };
+                    if level.abs() > max {
+                        skipped.push(json!({"id": id.0, "reason": format!("tilted {:.1}°, above {max}°", level.abs())}));
+                        continue;
+                    }
+                    let angle = (level * 100.0).round() / 100.0;
+                    angles.insert(id.0.to_string(), json!(angle));
+                    if (angle - d.crop.geometry.angle).abs() < 0.05 {
+                        continue;
+                    }
+                    let (w, h) = crop_dims(s, id);
+                    let mut nd = d;
+                    straighten_to(&mut nd, w, h, angle);
+                    ops.extend(s.develop_op(id, nd, "Auto Straighten"));
+                }
+                let n = ops.len();
+                if n > 0 {
+                    s.commit("Auto Straighten Selected", Op::Batch { ops })?;
+                }
+                Ok(json!({"changed": n, "angles": angles, "skipped": skipped}))
             }
         ),
         cmd!(
@@ -736,6 +795,55 @@ pub fn specs() -> Vec<CommandSpec> {
                     s.commit("Match Total Exposures", Op::Batch { ops })?;
                 }
                 Ok(json!({"changed": n, "skipped": skipped}))
+            }
+        ),
+        cmd!(
+            "develop.balanceExposure",
+            "Balance Exposure to Active Photo",
+            ["Photo"],
+            None,
+            "{ids?} — keep each selected photo's look (preset, tone, colour) and set only its Exposure so its subject (centre-weighted, measured on the rendered photo) is as bright as in the active photo; unlike Match Total Exposures it works with flash and mixed light; at most ±3 EV per photo, one undo step → {changed, exposures: {id: value}, skipped}",
+            has_selection,
+            |s, p| {
+                let c = "develop.balanceExposure";
+                let req = lightcraft_pipeline::RenderRequest::fit(256, 256);
+                let brightness = |src: &lightcraft_raster::Rgb32f, info: &lightcraft_pipeline::SourceInfo, d: &DevelopSettings, exposure: f64| {
+                    let mut t = d.clone();
+                    t.light.exposure = exposure;
+                    lightcraft_pipeline::auto::subject_brightness(&lightcraft_pipeline::render(src, info, &t, &req).image)
+                };
+                let reference = active(s, c)?;
+                let r_src = s.source_now(reference, SourceLevel::Thumb).map_err(|e| bad(c, e))?;
+                let r_info = s.source_info(reference);
+                let r_dev = s.develop_of(reference).map(|d| (*d).clone()).unwrap_or_default();
+                let target = brightness(&r_src, &r_info, &r_dev, r_dev.light.exposure).ok_or_else(|| bad(c, "the active photo can't be measured"))?;
+                let (mut ops, mut exposures, mut skipped) = (Vec::new(), serde_json::Map::new(), Vec::new());
+                for id in s.targets(p).into_iter().filter(|x| *x != reference) {
+                    let Ok(src) = s.source_now(id, SourceLevel::Thumb) else {
+                        skipped.push(id.0);
+                        continue;
+                    };
+                    let info = s.source_info(id);
+                    let d = s.develop_of(id).map(|d| (*d).clone()).unwrap_or_default();
+                    let start = d.light.exposure;
+                    let Some(e) = lightcraft_pipeline::auto::solve_exposure(start, target, |x| brightness(&src, &info, &d, x)) else {
+                        skipped.push(id.0);
+                        continue;
+                    };
+                    let e = (e.clamp(start - BALANCE_MAX_SHIFT_EV, start + BALANCE_MAX_SHIFT_EV) * 100.0).round() / 100.0;
+                    exposures.insert(id.0.to_string(), json!(e));
+                    if (e - start).abs() < 0.01 {
+                        continue;
+                    }
+                    let mut nd = d;
+                    nd.light.exposure = e;
+                    ops.extend(s.develop_op(id, nd, "Balance Exposure"));
+                }
+                let n = ops.len();
+                if n > 0 {
+                    s.commit("Balance Exposure", Op::Batch { ops })?;
+                }
+                Ok(json!({"changed": n, "exposures": exposures, "skipped": skipped}))
             }
         ),
         cmd!(
